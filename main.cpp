@@ -1,3 +1,9 @@
+// https://github.com/RoboDurden/Hoverboard-Firmware-Hack-Gen2.x-GD32
+// MCU : ESP32 T-Display
+// 호버보드 제어를 위한  Arduino 프로그램
+// RC수신기(PPM, PWM) -> MCU -> 호버보드
+
+
 /*  2025.10.21 19:25
 
 호버보드용 시리얼 통신모듈 (REMOTE_UART) : RC PPM/PWM입력 -> 신호처리(MCU) -> SERIAL출력 -> 호버보드
