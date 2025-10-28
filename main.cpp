@@ -27,6 +27,8 @@ iSpeedLeft만 제어, iSpeedRight 항상 0
  LCD에 모드 선택 시 메시지 표시
 ---------------------------------------------------------------
 */
+/*  2025.10.28 추가 : 수신(Feedback, RX핀) 기능
+
 
 #include <Arduino.h>
 #include <TFT_eSPI.h>
@@ -34,7 +36,9 @@ iSpeedLeft만 제어, iSpeedRight 항상 0
 
 // ---------------- CONFIG ----------------
 #define HOVER_TX1 21
-#define HOVER_TX2 22
+#define HOVER_RX1 22
+#define HOVER_TX2 17
+#define HOVER_RX2 2
 #define HOVER_BAUD 19200
 #define CRC_POLY 0x1021
 #define START_CHAR '/'
@@ -68,7 +72,7 @@ Preferences prefs;
 uint16_t channelValues[8] = {1500};
 uint16_t lastValue[8] = {0};
 
-// ---------------- 구조체 ----------------
+// ---------------- 전송 구조체 ----------------
 #pragma pack(push, 1)
 typedef struct {
   uint8_t  cStart;
@@ -82,6 +86,23 @@ typedef struct {
 
 SerialServer2HoverDual hoverTx;
 
+// ---------------- 수신 구조체 ----------------
+#pragma pack(push,1)
+struct HoverboardData {
+    uint16_t startFrame;     
+    int16_t  speedL;         
+    int16_t  speedR;         
+    uint16_t voltage;        
+    int16_t  currentL;       
+    int16_t  currentR;       
+    int32_t  odometerL;      
+    int32_t  odometerR;      
+    uint16_t checksum;       
+};
+#pragma pack(pop)
+
+HoverboardData hoverboardData;
+
 // ---------------- CRC ----------------
 uint16_t CalcCRC(uint8_t *ptr, int count) {
   uint16_t crc = 0;
@@ -91,6 +112,16 @@ uint16_t CalcCRC(uint8_t *ptr, int count) {
       crc = (crc & 0x8000) ? (crc << 1) ^ CRC_POLY : (crc << 1);
   }
   return crc;
+}
+
+uint16_t calculateCRC(const uint8_t* data, size_t length) {
+    uint16_t crc = 0;
+    while (length--) {
+        crc ^= (uint16_t)(*data++) << 8;
+        for (uint8_t i = 0; i < 8; i++)
+            crc = (crc & 0x8000) ? (crc << 1) ^ CRC_POLY : (crc << 1);
+    }
+    return crc;
 }
 
 // ---------------- 모터 제어 ----------------
@@ -187,7 +218,7 @@ uint32_t pulseInSafe(uint8_t pin) {
   return val ? val : 1500;
 }
 
-// ---------------- 버튼 3초 길게 누름 (재부팅) ----------------
+// ---------------- 버튼 ----------------
 void checkButtonLongPress() {
     static unsigned long btn1Start = 0;
     static unsigned long btn2Start = 0;
@@ -195,7 +226,6 @@ void checkButtonLongPress() {
     bool btn1 = digitalRead(BTN1_PIN) == LOW;
     bool btn2 = digitalRead(BTN2_PIN) == LOW;
 
-    // ---------------- PPM 선택 ----------------
     if (btn1 && !btn2) {
         if (btn1Start == 0) btn1Start = millis();
         if (millis() - btn1Start >= 3000) {
@@ -215,7 +245,6 @@ void checkButtonLongPress() {
         }
     } else btn1Start = 0;
 
-    // ---------------- PWM 선택 ----------------
     if (btn2 && !btn1) {
         if (btn2Start == 0) btn2Start = millis();
         if (millis() - btn2Start >= 3000) {
@@ -248,31 +277,64 @@ void setup() {
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
   tft.setCursor(10, 5);
 
-  // ---------------- 저장된 모드 읽기 ----------------
   prefs.begin("io_mode", false);
   currentMode = (InputMode)prefs.getUChar("mode", MODE_PWM);
   prefs.end();
 
-  // ---------------- 모드별 핀 초기화 ----------------
   if (currentMode == MODE_PPM) {
     pinMode(PPM_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(PPM_PIN), ppmISR, RISING);
-    tft.println("  PPM IN MODE");
+    tft.println(" PPM MODE ");
   } else {
     pinMode(PWM_CH1_PIN, INPUT_PULLUP);
     pinMode(PWM_CH2_PIN, INPUT_PULLUP);
     pinMode(PWM_CH3_PIN, INPUT_PULLUP);
     pinMode(PWM_CH4_PIN, INPUT_PULLUP);
-    tft.println(" PWM IN MODE(4CH)");
+    tft.println(" PWM MODE ");
   }
 
-  hoverSerial1.begin(HOVER_BAUD, SERIAL_8N1, -1, HOVER_TX1);
-  hoverSerial2.begin(HOVER_BAUD, SERIAL_8N1, -1, HOVER_TX2);
+  hoverSerial1.begin(HOVER_BAUD, SERIAL_8N1, HOVER_RX1, HOVER_TX1);
+  hoverSerial2.begin(HOVER_BAUD, SERIAL_8N1, HOVER_RX2, HOVER_TX2);
+}
+
+// ---------------- 호버보드 상태 수신 ----------------
+void receiveHoverData(HardwareSerial &serialPort) {
+    const uint16_t START_FRAME = 0xABCD;
+    if (serialPort.available() > 0) {
+        if (serialPort.read() == (START_FRAME & 0xFF)) {
+            unsigned long startTime = millis();
+            while (serialPort.available() < 1) {
+                if (millis() - startTime > 10) return;
+            }
+            if (serialPort.read() == (START_FRAME >> 8)) {
+                size_t bytesToRead = sizeof(HoverboardData) - 2;
+                startTime = millis();
+                while (serialPort.available() < bytesToRead) {
+                    if (millis() - startTime > 200) return;
+                }
+                uint8_t buffer[sizeof(HoverboardData)];
+                buffer[0] = START_FRAME & 0xFF;
+                buffer[1] = START_FRAME >> 8;
+                serialPort.readBytes(buffer + 2, bytesToRead);
+                memcpy(&hoverboardData, buffer, sizeof(HoverboardData));
+                uint16_t crc = calculateCRC(buffer, sizeof(HoverboardData)-2);
+                if (crc == hoverboardData.checksum) {
+                    // TFT 표시
+                    tft.setTextSize(2);
+                    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+                    //tft.setCursor(10, 90);
+                    tft.setCursor(140, 5);
+                    //tft.printf("Bat: %.2fV", hoverboardData.voltage / 100.0f);
+                    tft.printf("%.2fV ", hoverboardData.voltage / 100.0f);
+                }
+            }
+        }
+    }
 }
 
 // ---------------- LOOP ----------------
 void loop() {
-    checkButtonLongPress();  // 운영 중 3초 길게 누름 감지
+    checkButtonLongPress();
 
     if (currentMode == MODE_PPM) {
         if (ppmFrameComplete) ppmFrameComplete = false;
@@ -288,4 +350,8 @@ void loop() {
 
     sendHoverCmd(steer, speed);
     drawVerticalBars();
+
+    // 호버보드 상태 수신
+    receiveHoverData(hoverSerial1);
+    //receiveHoverData(hoverSerial2);
 }
