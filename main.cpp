@@ -27,8 +27,11 @@ iSpeedLeft만 제어, iSpeedRight 항상 0
  LCD에 모드 선택 시 메시지 표시
 ---------------------------------------------------------------
 */
-/*  2025.10.28 추가 : 수신(Feedback, RX핀) 기능  */
 
+/* 2025.10.28 추가
+   - 수신(Feedback, RX핀) 기능 (호버보드 배터리 전압표시)
+   - FailSafe 기능 : 수신기 배터리분리시 모터 오동작 방지
+*/
 
 #include <Arduino.h>
 #include <TFT_eSPI.h>
@@ -200,6 +203,7 @@ void drawVerticalBars() {
 volatile uint32_t lastRise = 0;
 volatile uint8_t ppmIndex = 0;
 volatile bool ppmFrameComplete = false;
+volatile unsigned long lastPPMTime = 0;
 
 void IRAM_ATTR ppmISR() {
   uint32_t now = micros();
@@ -210,6 +214,7 @@ void IRAM_ATTR ppmISR() {
     channelValues[ppmIndex++] = diff;
     if (ppmIndex >= 8) ppmFrameComplete = true;
   }
+  lastPPMTime = millis(); // 마지막 PPM 신호 시간 갱신
 }
 
 // ---------------- PWM ----------------
@@ -322,9 +327,7 @@ void receiveHoverData(HardwareSerial &serialPort) {
                     // TFT 표시
                     tft.setTextSize(2);
                     tft.setTextColor(TFT_GREEN, TFT_BLACK);
-                    //tft.setCursor(10, 90);
                     tft.setCursor(140, 5);
-                    //tft.printf("Bat: %.2fV", hoverboardData.voltage / 100.0f);
                     tft.printf("%.2fV ", hoverboardData.voltage / 100.0f);
                 }
             }
@@ -336,22 +339,40 @@ void receiveHoverData(HardwareSerial &serialPort) {
 void loop() {
     checkButtonLongPress();
 
+    bool signalLost = false;
+    const unsigned long SIGNAL_TIMEOUT = 80; // GPT추천 적정값 100 ms,  RC수신기 신호 Lost 타임아웃
+
     if (currentMode == MODE_PPM) {
         if (ppmFrameComplete) ppmFrameComplete = false;
+        if (millis() - lastPPMTime > SIGNAL_TIMEOUT) signalLost = true;
     } else {
-        channelValues[0] = pulseInSafe(PWM_CH1_PIN);
-        channelValues[1] = pulseInSafe(PWM_CH2_PIN);
-        channelValues[2] = pulseInSafe(PWM_CH3_PIN);
-        channelValues[3] = pulseInSafe(PWM_CH4_PIN);
+        // PWM 모드에서는 pulseInSafe값이 0~1500 이상이면 정상, 아닐 경우 신호 끊김
+        for (int i=0;i<4;i++){
+            if(channelValues[i]<900 || channelValues[i]>2100){
+                signalLost = true;
+                break;
+            }
+        }
     }
 
-    int16_t steer = map(constrain(channelValues[CH_STEER], 1000, 2000), 1000, 2000, -MAX_STEER, MAX_STEER);
-    int16_t speed = map(constrain(channelValues[CH_SPEED], 1000, 2000), 1000, 2000, -MAX_SPEED, MAX_SPEED);
+    int16_t steer=0, speed=0;
+    if(signalLost){
+        steer=0;
+        speed=0;
+    }else{
+        if(currentMode==MODE_PWM){
+            channelValues[0] = pulseInSafe(PWM_CH1_PIN);
+            channelValues[1] = pulseInSafe(PWM_CH2_PIN);
+            channelValues[2] = pulseInSafe(PWM_CH3_PIN);
+            channelValues[3] = pulseInSafe(PWM_CH4_PIN);
+        }
+        steer = map(constrain(channelValues[CH_STEER], 1000, 2000), 1000, 2000, -MAX_STEER, MAX_STEER);
+        speed = map(constrain(channelValues[CH_SPEED], 1000, 2000), 1000, 2000, -MAX_SPEED, MAX_SPEED);
+    }
 
     sendHoverCmd(steer, speed);
     drawVerticalBars();
 
-    // 호버보드 상태 수신
     receiveHoverData(hoverSerial1);
     //receiveHoverData(hoverSerial2);
 }
